@@ -7,6 +7,10 @@
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod stamp;
 
+// The browser-free half of the bridge (`host`), tested on the host target.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod bridge;
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use eframe::wasm_bindgen::JsCast;
@@ -70,9 +74,15 @@ fn main() {
                         {
                             app.comment_prefs.author = author.chars().take(200).collect();
                         }
-                        bridge.listen(app.startup_inbox.clone(), app.host_inbox.clone(), app.host_requests.clone(), cc.egui_ctx.clone());
+                        bridge.listen(
+                            app.startup_inbox.clone(),
+                            app.host_inbox.clone(),
+                            app.host_requests.clone(),
+                            app.host_menu_items.clone(),
+                            cc.egui_ctx.clone(),
+                        );
                         app.host_save = Some(bridge.save_fn());
-                        app.host_events = Some(bridge.events_fn());
+                        app.host_events = Some(bridge.events_fn(cc.egui_ctx.clone()));
                         bridge.post_ready();
                     } else if query_param("host").as_deref() == Some("parent") {
                         eframe::web_sys::console::warn_1(
@@ -147,11 +157,27 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// - `pdfcraft:request-save` `{ id }`: save that tab as Save would (never Save As), delivered as
 ///   `pdfcraft:save`, even when it has nothing unsaved. While the user is typing into it or a
 ///   dialog is open the save waits until that ends. An unknown `id` gets `pdfcraft:save-failed`.
+/// - `pdfcraft:menu-items` `{ items: [{ key, label }] }` (level 2): the parent's own items for
+///   the text-selection menus (the right-click menu and the bar beside selected text), shown
+///   after Copy, in order, while text is selected. `key` is 1–32 of `a-z 0-9 _ -`, `label` (shown
+///   as given: the parent translates it) 1–64 characters after trimming; invalid entries, entries
+///   past the eighth and repeated keys are dropped. Each message replaces the list; `[]` removes
+///   them.
+/// - `pdfcraft:goto` `{ id, page, find? }` (level 2): bring the tab with that id to the front at
+///   `page` (a whole number, clamped to the page count). With `find`, also look for that passage
+///   (spaces collapsed, at most 500 characters) on or near the page through the find bar: the
+///   first match on the page, else the nearest within two pages, else the same for its first six
+///   and then three words. `pdfcraft:found` answers every goto with `find`, and any goto for an
+///   unknown `id`.
+/// - `pdfcraft:selection-now` `{ seq? }` (level 2): send the selection waiting for its 300 ms
+///   now, once the input that came before this message has been drawn (a shortcut pressed right
+///   after selecting), then answer `pdfcraft:selection-sent`.
 ///
 /// To the parent:
 ///
 /// - `pdfcraft:ready` `{ version, bridge }`: the app is listening; send files now. `bridge` is
-///   the protocol level (1: everything listed here), absent in builds before it.
+///   the protocol level (2: everything listed here; 1: without the messages marked level 2),
+///   absent in builds before it.
 /// - `pdfcraft:save` `{ name, saveAs, bytes, id }` when a tab is saved (by the user, the
 ///   unsaved-changes prompt or `pdfcraft:request-save`); `bytes` is a transferred `ArrayBuffer`,
 ///   `id` the tab's id or `null`. The parent stores the file and reports its own errors. If the
@@ -171,6 +197,27 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 ///   whenever the theme the interface is drawn with changes, so the host can match it.
 /// - `pdfcraft:failed` `{ error }` when the app couldn't start, or `{ error, id }` when a tagged
 ///   document couldn't be opened (unreadable, or its password prompt was cancelled).
+///
+/// Level 2 adds (rectangles are `[x, y, width, height]`: on a page in points of the page as
+/// shown unrotated, y down; on screen in CSS pixels of this frame's viewport):
+///
+/// - `pdfcraft:selection` `{ id, page, text, rects }` when the text selected in the tagged tab in
+///   front has rested for 300 ms after changing (only the last state is sent, never the same one
+///   twice in a row). `text` is as Copy puts it (at most 20 000 characters), `rects` one per
+///   selected piece of a line on `page` (at most 2 000). A cleared selection, or one left behind
+///   when another tab comes to the front, is `{ id, page, text: "", rects: [] }`.
+/// - `pdfcraft:menu` `{ key, id, page, text, rects, anchor }` when one of the parent's menu items
+///   is clicked; `id` is the tab's id or `null`, `anchor` the last selection rectangle on screen
+///   (to place a popup by). The text stays selected.
+/// - `pdfcraft:menu-shown` `{ id, items: [{ key, rect }] }` while a menu or the selection bar
+///   shows the parent's items, again when they move, and once with `items: []` when they are
+///   gone; `rect` is on screen.
+/// - `pdfcraft:selection-sent` `{ seq }` answers `pdfcraft:selection-now`, after its
+///   `pdfcraft:selection` (if one was waiting); `seq` is the one asked with (a whole number up to
+///   2^32 - 1), or `null`.
+/// - `pdfcraft:found` `{ id, page, query, found }`: how a `pdfcraft:goto` went. `page` is the
+///   page of the match, or the page asked for when there is none; `query` the passage as looked
+///   for (spaces collapsed).
 #[cfg(target_arch = "wasm32")]
 mod host {
     use std::cell::RefCell;
@@ -180,8 +227,10 @@ mod host {
     use eframe::wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use pdfcraft_ui_egui::{HostEvent, HostOpen, HostRequest};
 
+    use crate::bridge::{Debounce, Fire};
+
     /// The protocol level sent with `pdfcraft:ready`.
-    const BRIDGE_LEVEL: u32 = 1;
+    const BRIDGE_LEVEL: u32 = 2;
     /// `pdfcraft:page` is sent at most this often (ms).
     const PAGE_INTERVAL_MS: i32 = 250;
     /// `pdfcraft:activity` is sent at most this often per id (ms).
@@ -197,7 +246,6 @@ mod host {
         state: Rc<RefCell<State>>,
     }
 
-    #[derive(Default)]
     struct State {
         /// The `infoKey` each id asked for.
         info_keys: HashMap<String, String>,
@@ -207,6 +255,29 @@ mod host {
         page_pending: Option<(String, usize)>,
         page_sent: Option<(String, usize)>,
         page_timer: bool,
+        /// The selection waiting for its `pdfcraft:selection`.
+        selection: Debounce<Selection>,
+    }
+
+    impl Default for State {
+        fn default() -> Self {
+            Self {
+                info_keys: HashMap::new(),
+                activity: HashMap::new(),
+                page_pending: None,
+                page_sent: None,
+                page_timer: false,
+                selection: Debounce::new(crate::bridge::SELECTION_DEBOUNCE_MS),
+            }
+        }
+    }
+
+    #[derive(Clone, PartialEq)]
+    struct Selection {
+        tag: String,
+        page: usize,
+        text: String,
+        rects: Vec<[f32; 4]>,
     }
 
     impl Bridge {
@@ -257,6 +328,7 @@ mod host {
             startup: pdfcraft_ui_egui::Inbox,
             inbox: pdfcraft_ui_egui::HostInbox,
             requests: pdfcraft_ui_egui::HostRequests,
+            menu_items: pdfcraft_ui_egui::HostMenuItems,
             ctx: egui::Context,
         ) {
             let bridge = self.clone();
@@ -307,6 +379,37 @@ mod host {
                             q.push(HostRequest::Save { tag });
                         }
                     }
+                    Some("pdfcraft:menu-items") => {
+                        let Ok(items) = js_sys::Reflect::get(&data, &JsValue::from_str("items")) else { return };
+                        if !js_sys::Array::is_array(&items) {
+                            eframe::web_sys::console::warn_1(&"PdfCraft: ignored pdfcraft:menu-items without an items array".into());
+                            return;
+                        }
+                        let array = js_sys::Array::from(&items);
+                        let entries = array.iter().take(crate::bridge::MAX_MENU_ITEMS).map(|entry| (string(&entry, "key"), string(&entry, "label")));
+                        let items = crate::bridge::menu_items(entries);
+                        if let Ok(mut list) = menu_items.lock() {
+                            *list = items;
+                        }
+                    }
+                    Some("pdfcraft:goto") => {
+                        let Some(tag) = id else { return };
+                        let Some(page) =
+                            js_sys::Reflect::get(&data, &JsValue::from_str("page")).ok().and_then(|p| p.as_f64()).and_then(crate::bridge::goto_page)
+                        else {
+                            eframe::web_sys::console::warn_1(&"PdfCraft: ignored pdfcraft:goto without a whole, non-negative page".into());
+                            return;
+                        };
+                        let find = string(&data, "find").and_then(|f| crate::bridge::goto_find(&f));
+                        if let Ok(mut q) = requests.lock() {
+                            q.push(HostRequest::Goto { tag, page, find });
+                        }
+                    }
+                    Some("pdfcraft:selection-now") => {
+                        let seq =
+                            js_sys::Reflect::get(&data, &JsValue::from_str("seq")).ok().and_then(|s| s.as_f64()).and_then(crate::bridge::request_seq);
+                        bridge.selection_now(seq);
+                    }
                     _ => return,
                 }
                 ctx.request_repaint();
@@ -341,12 +444,12 @@ mod host {
             })
         }
 
-        pub fn events_fn(&self) -> pdfcraft_ui_egui::HostEventFn {
+        pub fn events_fn(&self, ctx: egui::Context) -> pdfcraft_ui_egui::HostEventFn {
             let bridge = self.clone();
-            Box::new(move |event: HostEvent| bridge.on_event(event))
+            Box::new(move |event: HostEvent| bridge.on_event(event, &ctx))
         }
 
-        fn on_event(&self, event: HostEvent) {
+        fn on_event(&self, event: HostEvent, ctx: &egui::Context) {
             match event {
                 HostEvent::Active { tag, page, page_count } => {
                     {
@@ -408,9 +511,118 @@ mod host {
                 HostEvent::Theme { dark } => {
                     self.send(&[("type", "pdfcraft:theme".into()), ("theme", if dark { "dark" } else { "light" }.into())]);
                 }
+                HostEvent::Selection { tag, page, text, rects } => {
+                    let schedule = self.state.borrow_mut().selection.push(Selection { tag, page, text, rects }, js_sys::Date::now());
+                    if schedule {
+                        self.schedule_selection(crate::bridge::SELECTION_DEBOUNCE_MS);
+                    }
+                }
+                HostEvent::Menu { key, tag, page, text, rects, anchor } => {
+                    self.send(&[
+                        ("type", "pdfcraft:menu".into()),
+                        ("key", key.as_str().into()),
+                        ("id", optional(tag.as_deref())),
+                        ("page", number(page)),
+                        ("text", text.as_str().into()),
+                        ("rects", page_rects(&rects)),
+                        ("anchor", self.screen_rect(anchor, ctx)),
+                    ]);
+                }
+                HostEvent::MenuShown { tag, items } => {
+                    let list = js_sys::Array::new();
+                    for (key, rect) in &items {
+                        if let Some(item) = message(&[("key", key.as_str().into()), ("rect", self.screen_rect(*rect, ctx))]) {
+                            list.push(&item);
+                        }
+                    }
+                    self.send(&[("type", "pdfcraft:menu-shown".into()), ("id", optional(tag.as_deref())), ("items", list.into())]);
+                }
+                HostEvent::Found { tag, page, query, found } => {
+                    self.send(&[
+                        ("type", "pdfcraft:found".into()),
+                        ("id", tag.as_str().into()),
+                        ("page", number(page)),
+                        ("query", query.as_str().into()),
+                        ("found", found.into()),
+                    ]);
+                }
                 // Events of a later protocol level.
                 _ => {}
             }
+        }
+
+        /// A screen rectangle (egui points) in CSS pixels of the frame; `null` when not finite.
+        fn screen_rect(&self, rect: [f32; 4], ctx: &egui::Context) -> JsValue {
+            crate::bridge::screen_rect(rect, ctx.pixels_per_point(), self.window.device_pixel_ratio()).map_or(JsValue::NULL, rect_value)
+        }
+
+        /// Check the pending `pdfcraft:selection` in `ms`; without a timer, send it now.
+        fn schedule_selection(&self, ms: f64) {
+            let bridge = self.clone();
+            let fire = Closure::once_into_js(move || bridge.flush_selection());
+            // At most a few hundred ms: the cast can't overflow.
+            let ms = ms.clamp(0.0, 60_000.0).ceil() as i32;
+            if self.window.set_timeout_with_callback_and_timeout_and_arguments_0(fire.unchecked_ref(), ms).is_err() {
+                self.state.borrow_mut().selection.no_timer();
+                self.flush_selection_now();
+            }
+        }
+
+        fn flush_selection(&self) {
+            let fire = self.state.borrow_mut().selection.fire(js_sys::Date::now());
+            match fire {
+                Fire::Send(selection) => self.post_selection(selection),
+                Fire::Wait(ms) => self.schedule_selection(ms),
+                Fire::Idle => {}
+            }
+        }
+
+        /// Answer `pdfcraft:selection-now` two animation frames from now, so the frame that
+        /// handles the input received before it (a selection made just before the shortcut) has
+        /// reported its selection. A hidden page draws no frames: answer at once.
+        fn selection_now(&self, seq: Option<u32>) {
+            if self.window.document().is_some_and(|d| d.hidden()) {
+                self.answer_selection_now(seq);
+                return;
+            }
+            let bridge = self.clone();
+            let next = Closure::once_into_js(move || {
+                let last = bridge.clone();
+                let answer = Closure::once_into_js(move || last.answer_selection_now(seq));
+                if bridge.window.request_animation_frame(answer.unchecked_ref()).is_err() {
+                    bridge.answer_selection_now(seq);
+                }
+            });
+            if self.window.request_animation_frame(next.unchecked_ref()).is_err() {
+                self.answer_selection_now(seq);
+            }
+        }
+
+        fn answer_selection_now(&self, seq: Option<u32>) {
+            let pending = self.state.borrow_mut().selection.flush();
+            if let Some(selection) = pending {
+                self.post_selection(selection);
+            }
+            self.send(&[("type", "pdfcraft:selection-sent".into()), ("seq", seq.map_or(JsValue::NULL, |s| JsValue::from_f64(f64::from(s))))]);
+        }
+
+        /// No timer to wait with: send the pending selection rather than never.
+        fn flush_selection_now(&self) {
+            let fire = self.state.borrow_mut().selection.fire(f64::INFINITY);
+            if let Fire::Send(selection) = fire {
+                self.post_selection(selection);
+            }
+        }
+
+        fn post_selection(&self, selection: Selection) {
+            self.send(&[
+                ("type", "pdfcraft:selection".into()),
+                ("id", selection.tag.as_str().into()),
+                ("page", number(selection.page)),
+                ("text", selection.text.as_str().into()),
+                ("rects", page_rects(&selection.rects)),
+            ]);
+            self.state.borrow_mut().selection.sent(selection);
         }
 
         /// Send the pending `pdfcraft:page` in `PAGE_INTERVAL_MS`. `false` if no timer could be set.
@@ -467,6 +679,15 @@ mod host {
         } else {
             None
         }
+    }
+
+    fn rect_value(r: [f64; 4]) -> JsValue {
+        r.iter().map(|v| JsValue::from_f64(*v)).collect::<js_sys::Array>().into()
+    }
+
+    /// Page rectangles as `[[x, y, width, height]]`; rectangles that aren't finite are left out.
+    fn page_rects(rects: &[[f32; 4]]) -> JsValue {
+        rects.iter().filter_map(|r| crate::bridge::page_rect(*r)).map(rect_value).collect::<js_sys::Array>().into()
     }
 
     fn optional(s: Option<&str>) -> JsValue {

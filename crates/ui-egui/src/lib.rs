@@ -160,7 +160,10 @@ use pdfcraft_engine::{DocId, Session};
 pub use canvas::{DocView, RasterMemory};
 pub use editing::{CloseRequest, SaveTarget};
 pub use files::{ExtractDraft, FilePurpose, FileRequest, RotateDraft, SplitDraft, SplitMode, SplitPlan};
-pub use host::{HostEvent, HostEventFn, HostInbox, HostOpen, HostRequest, HostRequests, HostSave};
+pub use host::{
+    HostEvent, HostEventFn, HostInbox, HostMenuItem, HostMenuItems, HostOpen, HostRequest, HostRequests, HostSave, MAX_HOST_FIND_CHARS,
+    MAX_HOST_RECTS, MAX_HOST_TEXT_CHARS,
+};
 pub use recovery::{AUTOSAVE_SECS, RecoveryMeta, RecoveryStore};
 use theme::{ThemeKind, ThemePreference};
 
@@ -644,6 +647,8 @@ pub struct PdfCraftApp {
     pub host_requests: HostRequests,
     /// Tells the host what changed (see [`HostEvent`]).
     pub host_events: Option<HostEventFn>,
+    /// The host's items for the text-selection menus (see [`HostMenuItem`]).
+    pub host_menu_items: HostMenuItems,
     host: host::HostState,
     /// A pending "save changes?" question (closing a dirty tab or quitting).
     pub close_request: Option<CloseRequest>,
@@ -1026,6 +1031,7 @@ impl PdfCraftApp {
             host_inbox: Default::default(),
             host_requests: Default::default(),
             host_events: None,
+            host_menu_items: Default::default(),
             host: Default::default(),
             close_request: None,
             save_prompt_button: Default::default(),

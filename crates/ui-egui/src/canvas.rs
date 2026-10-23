@@ -463,6 +463,8 @@ pub struct DocView {
     /// Text layers, extracted in the background on demand (selection, find, copy).
     pub(crate) texts: HashMap<usize, Arc<PageText>>,
     pub(crate) text_failed: HashSet<usize>,
+    /// Pages whose text a host wants, visible or not (a passage it sent the reader to, `host`).
+    pub(crate) host_text_pages: Vec<usize>,
     pub find: Option<Find>,
     selection: Option<Selection>,
     /// The selection whose action bar was closed by its Copy button: the bar stays hidden
@@ -773,6 +775,7 @@ impl DocView {
             tiles: HashMap::new(),
             texts: HashMap::new(),
             text_failed: HashSet::new(),
+            host_text_pages: Vec::new(),
             find: None,
             selection: None,
             actions_dismissed: None,
@@ -1269,6 +1272,15 @@ impl DocView {
         let (_, xf) = self.screen_xforms.iter().find(|(p, _)| *p == page)?;
         let g = self.texts.get(&page)?.glyphs.get(glyph)?;
         Some(xf.view_rect(g.rect).center())
+    }
+
+    /// The text selection as a host hears it (`host`): its page, text and one rectangle per
+    /// selected piece of a line (view space). `None` without selected text.
+    pub(crate) fn host_selection(&self) -> Option<(usize, String, Vec<[f32; 4]>)> {
+        let s = self.selection?;
+        let t = self.texts.get(&s.page)?;
+        let text = s.text(t);
+        (!text.is_empty()).then(|| (s.page, text, s.rects(t)))
     }
 
     /// Selected text, if any (⌘C).
@@ -4001,6 +4013,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     copy_selected = true;
                     ui.close();
                 }
+                if crate::host::selection_menu_items(ui, view, false) {
+                    ui.close();
+                }
                 ui.separator();
             }
             // Over a picture (and no comment): Copy Image, as in Acrobat's page menu.
@@ -4168,6 +4183,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     // Text layers: visible pages for selection, every page while a search is active.
     let need_text = |p: &usize| !view.texts.contains_key(p) && !view.text_failed.contains(p);
     let mut text_pages: Vec<usize> = if hand { Vec::new() } else { visible_now.iter().copied().filter(need_text).collect() };
+    let host_pages: Vec<usize> =
+        view.host_text_pages.iter().copied().filter(|p| *p < info.pages.len() && need_text(p) && !text_pages.contains(p)).collect();
+    text_pages.extend(host_pages);
     if view.find.as_ref().is_some_and(|f| !f.case_query.trim().is_empty()) {
         let n = info.pages.len();
         let rest: Vec<usize> = (0..n).map(|k| (cur + k) % n).filter(need_text).filter(|p| !text_pages.contains(p)).collect();
@@ -4454,12 +4472,17 @@ fn selection_actions(
     if !viewport.intersects(rect) {
         return false;
     }
-    let x = rect.left().clamp(viewport.left() + 8.0, (viewport.right() - 520.0).max(viewport.left() + 8.0));
-    let y = if rect.bottom() + 48.0 < viewport.bottom() { rect.bottom() + 6.0 } else { (rect.top() - 44.0).max(viewport.top() + 6.0) };
+    let area = egui::Id::new(("text-selection-actions", view.id.0));
+    // A host's items (`host`) add a row: place the bar by its size as last drawn.
+    let drawn = ui.ctx().memory(|m| m.area_rect(area)).map(|r| r.size()).unwrap_or_default();
+    let (w, h) = (drawn.x.max(520.0), (drawn.y - 38.0).max(0.0));
+    let x = rect.left().clamp(viewport.left() + 8.0, (viewport.right() - w).max(viewport.left() + 8.0));
+    let y = if rect.bottom() + 48.0 + h < viewport.bottom() { rect.bottom() + 6.0 } else { (rect.top() - 44.0 - h).max(viewport.top() + 6.0) };
     let mut chosen = None;
-    egui::Area::new(egui::Id::new(("text-selection-actions", view.id.0))).order(egui::Order::Foreground).fixed_pos(pos2(x, y)).show(ui.ctx(), |ui| {
+    let mut host_clicked = false;
+    egui::Area::new(area).order(egui::Order::Foreground).fixed_pos(pos2(x, y)).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
+            let row = ui.horizontal(|ui| {
                 for (label, action) in [
                     (tl!("Add comment"), SelectionAction::Note),
                     (tl!("Highlight"), SelectionAction::Markup(comments::CommentTool::Highlight)),
@@ -4475,8 +4498,15 @@ fn selection_actions(
                     chosen = Some(SelectionAction::Copy);
                 }
             });
+            ui.set_max_width(row.response.rect.width());
+            host_clicked = crate::host::selection_menu_items(ui, view, true);
         });
     });
+    if host_clicked {
+        // Like Copy: the bar closes and the words stay selected for the host.
+        view.actions_dismissed = Some(selection);
+        return false;
+    }
     let Some(action) = chosen else { return false };
     if let SelectionAction::Copy = action {
         // Copying closes the bar but keeps the words selected, for ⌘C or a second action.
