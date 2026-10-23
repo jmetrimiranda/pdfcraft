@@ -13,8 +13,14 @@ workspace = true
 pdfcraft-ui-egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "glow", "persistence", "accesskit"] }
 egui = { workspace = true }
+# Writing the host's `infoKey` entry into saved files (`stamp`).
+pdfcraft-cos = { workspace = true }
+pdfcraft-organize = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Location", "Url", "UrlSearchParams", "Response", "Event", "MessageEvent", "EventTarget"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Location", "Url", "UrlSearchParams", "Response", "Event", "MessageEvent", "EventTarget", "VisibilityState"] }
 js-sys = "0.3"
+
+[dev-dependencies]
+pdfcraft-testkit = { workspace = true }

@@ -633,6 +633,10 @@ impl PdfCraftApp {
             return false;
         }
         let Some(id) = self.views.get(index).map(|v| v.id) else { return false };
+        // A host that asked for saves (`?host=parent` on the web) gets the bytes instead.
+        if self.host_save.is_some() {
+            return self.save_to_host(index, id, target, after);
+        }
         let Some(doc) = self.session.get(id) else { return false };
         let (name, path) = (doc.name.clone(), doc.path.clone());
         #[cfg(not(target_arch = "wasm32"))]
@@ -667,14 +671,7 @@ impl PdfCraftApp {
                     return false;
                 }
             };
-            // An embedding page that asked for saves (`?host=parent`) gets the bytes; otherwise
-            // the browser downloads them.
-            let to_host = self.host_save.is_some();
-            let delivered = match &self.host_save {
-                Some(save) => save(&name, &bytes, matches!(target, SaveTarget::As)),
-                None => download(&name, &bytes),
-            };
-            match delivered {
+            match download(&name, &bytes) {
                 Ok(()) => {
                     let _ = self.session.mark_saved(id, bytes, None);
                     if let Some(doc) = self.session.get(id)
@@ -682,21 +679,59 @@ impl PdfCraftApp {
                     {
                         view.document_changed(&doc.info);
                     }
-                    // The host reports where the file went (and any failure) itself.
-                    if !to_host {
-                        self.notify_fmt("Downloaded {name}", &[("name", &name)]);
-                    }
+                    self.notify_fmt("Downloaded {name}", &[("name", &name)]);
                     after(self);
                     true
-                }
-                Err(e) if to_host => {
-                    self.notify_fmt("Couldn't save {name}: {e}", &[("name", &name), ("e", &e)]);
-                    false
                 }
                 Err(e) => {
                     self.notify_fmt("Couldn't download {name}: {e}", &[("name", &name), ("e", &e.to_string())]);
                     false
                 }
+            }
+        }
+    }
+
+    /// Hand document `id` (tab `index`) to the host (see [`crate::HostSaveFn`]), then `after`.
+    /// The host reports where the file went (and its own failures) itself. Returns `true` if the
+    /// host took the bytes.
+    fn save_to_host(&mut self, index: usize, id: pdfcraft_engine::DocId, target: SaveTarget, after: impl FnOnce(&mut Self)) -> bool {
+        let Some((name, password)) = self.session.get(id).map(|d| (d.name.clone(), d.password.clone())) else { return false };
+        if !self.flatten_fill_sign_for_save(id) {
+            return false;
+        }
+        let bytes = match self.session.save_bytes(id) {
+            Ok(b) => b,
+            Err(e) => {
+                self.notify_fmt("Couldn't save {name}: {e}", &[("name", &name), ("e", &e.to_string())]);
+                return false;
+            }
+        };
+        let tag = self.host.tags.get(&id).cloned();
+        let save = crate::HostSave {
+            name: &name,
+            bytes: &bytes,
+            save_as: matches!(target, SaveTarget::As),
+            tag: tag.as_deref(),
+            password: password.as_deref(),
+        };
+        let delivered = match &self.host_save {
+            Some(host_save) => host_save(&save),
+            None => Err("there is no host to save to".to_string()),
+        };
+        match delivered {
+            Ok(()) => {
+                let _ = self.session.mark_saved(id, bytes, None);
+                if let Some(doc) = self.session.get(id)
+                    && let Some(view) = self.views.get_mut(index)
+                {
+                    view.document_changed(&doc.info);
+                }
+                after(self);
+                true
+            }
+            Err(e) => {
+                self.notify_fmt("Couldn't save {name}: {e}", &[("name", &name), ("e", &e)]);
+                false
             }
         }
     }

@@ -94,6 +94,7 @@ pub mod folders_ui;
 mod format_text_ui;
 pub mod forms_ui;
 mod home;
+mod host;
 mod icon_data;
 pub mod icons;
 pub mod last_session;
@@ -159,6 +160,7 @@ use pdfcraft_engine::{DocId, Session};
 pub use canvas::{DocView, RasterMemory};
 pub use editing::{CloseRequest, SaveTarget};
 pub use files::{ExtractDraft, FilePurpose, FileRequest, RotateDraft, SplitDraft, SplitMode, SplitPlan};
+pub use host::{HostEvent, HostEventFn, HostInbox, HostOpen, HostRequest, HostRequests, HostSave};
 pub use recovery::{AUTOSAVE_SECS, RecoveryMeta, RecoveryStore};
 use theme::{ThemeKind, ThemePreference};
 
@@ -413,10 +415,10 @@ pub enum OsEvent {
 /// Returns the [`OsEvent`]s that arrived since it was last called (set by the desktop app).
 pub type OsEventsFn = Box<dyn FnMut() -> Vec<OsEvent>>;
 
-/// Hands a saved PDF to the page embedding PdfCraft (web): `(name, bytes, save_as)`. `save_as`
-/// is `true` for Save As. Set by the web app when a host page (such as a Nextcloud app) asked
-/// for saves; without it the browser downloads the file.
-pub type HostSaveFn = Box<dyn Fn(&str, &[u8], bool) -> Result<(), String>>;
+/// Hands a saved PDF to the host embedding PdfCraft (see [`HostSave`]). Set by the web app when a
+/// host page (such as a Nextcloud app) asked for saves; without it the browser downloads the
+/// file. When it returns `Ok` the document counts as saved.
+pub type HostSaveFn = Box<dyn Fn(&HostSave<'_>) -> Result<(), String>>;
 
 /// Told every frame whether any tab has unsaved work, so a host page can warn before leaving.
 pub type HostDirtyFn = Box<dyn FnMut(bool)>;
@@ -636,6 +638,13 @@ pub struct PdfCraftApp {
     pub host_save: Option<HostSaveFn>,
     /// Reports unsaved work to the embedding page (web, see [`HostDirtyFn`]).
     pub host_dirty: Option<HostDirtyFn>,
+    /// Documents the host hands in, tagged with its own ids (see [`HostOpen`]).
+    pub host_inbox: HostInbox,
+    /// What the host asks of its tagged documents (see [`HostRequest`]).
+    pub host_requests: HostRequests,
+    /// Tells the host what changed (see [`HostEvent`]).
+    pub host_events: Option<HostEventFn>,
+    host: host::HostState,
     /// A pending "save changes?" question (closing a dirty tab or quitting).
     pub close_request: Option<CloseRequest>,
     /// The button of the "save changes?" question the keyboard has chosen; Save when it opens.
@@ -1014,6 +1023,10 @@ impl PdfCraftApp {
             os_events: None,
             host_save: None,
             host_dirty: None,
+            host_inbox: Default::default(),
+            host_requests: Default::default(),
+            host_events: None,
+            host: Default::default(),
             close_request: None,
             save_prompt_button: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -3231,6 +3244,7 @@ impl eframe::App for PdfCraftApp {
                     self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
                 }
             }
+            self.take_host_opens();
         }
         let failed: Vec<(String, String)> = self.failed_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
         for (name, e) in failed {
@@ -3277,6 +3291,7 @@ impl eframe::App for PdfCraftApp {
                 report(dirty);
             }
         }
+        self.host_tick(ctx);
         self.poll_updates();
         self.poll_print();
         // Shortcuts deferred last frame: the text field has taken that frame's typing since.
