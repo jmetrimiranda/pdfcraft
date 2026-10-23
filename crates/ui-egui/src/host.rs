@@ -1,8 +1,9 @@
 //! Hooks for a host embedding PdfCraft, such as a same-origin page framing the web build
 //! (`apps/pdfcraft-web`, `?host=parent`). The host hands documents in tagged with its own id,
 //! asks for saves, sends the reader to a page (and a passage on it), adds its own items to the
-//! text-selection menus, and hears what the user is doing: which tagged document is in front,
-//! its page, the text selected in it, activity, unsaved work and the theme.
+//! text-selection menus, underlines words with its own temporary marks, and hears what the user
+//! is doing: which tagged document is in front, its page, the text selected in it, clicks on its
+//! marks, activity, unsaved work and the theme.
 //!
 //! This crate stays free of any browser API: the host owns the transport (`postMessage` on the
 //! web), the throttling and the debouncing. Here the app only takes requests from shared queues
@@ -15,7 +16,7 @@
 //! Rectangles are `[x0, y0, x1, y1]`: on a page in view space (points, y down, the page as
 //! shown unrotated), on screen in egui points.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pdfcraft_engine::DocId;
@@ -35,6 +36,18 @@ const GOTO_TIMEOUT_S: f64 = 5.0;
 const GOTO_TIMEOUT_FRAMES: u32 = 600;
 /// How far from the asked page a passage is still "near" it (pages).
 const GOTO_NEAR_PAGES: usize = 2;
+/// The most mark sets a document holds; a new set past it is ignored.
+pub const MAX_HOST_MARK_SETS: usize = 16;
+/// The most marks one set holds on one page; later ones are dropped.
+pub const MAX_HOST_MARKS_PER_PAGE: usize = 4_000;
+/// The most rectangles one mark holds; later ones are dropped.
+pub const MAX_HOST_MARK_RECTS: usize = 8;
+/// The most rectangles a document holds over all its sets and pages; past it, rectangles are dropped.
+pub const MAX_HOST_MARK_RECTS_TOTAL: usize = 200_000;
+/// How far around a mark's rectangles a click still lands on it (page points).
+const MARK_HIT_SLOP: f32 = 2.0;
+/// The underline's thickness in CSS pixels (device pixels ÷ the display's ratio).
+const MARK_LINE_CSS_PX: f32 = 2.0;
 
 /// A document the host hands in: `name` is shown on the tab, `bytes` hold the file.
 ///
@@ -54,7 +67,7 @@ pub struct HostOpen {
 pub type HostInbox = std::sync::Arc<std::sync::Mutex<Vec<HostOpen>>>;
 
 /// Something the host asks of a tagged document. More kinds may come; match with a wildcard.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum HostRequest {
     /// Save the tagged document through the normal Save path (never Save As), even when it has
@@ -68,6 +81,30 @@ pub enum HostRequest {
     /// six and then the first three of its words (a passage broken by hyphenation or a page
     /// furniture line still lands). [`HostEvent::Found`] tells how it went, once per request.
     Goto { tag: String, page: usize, find: Option<String> },
+    /// Replace the tagged document's marks of `set` on each page listed (in that order; a page
+    /// with no marks clears it), leaving its other pages as they are. See [`HostMark`]. A set
+    /// that is changed comes on top of the others. Pages past the page count are ignored, and so
+    /// is an unknown tag, or a new set when the document already has [`MAX_HOST_MARK_SETS`].
+    Marks { tag: String, set: String, pages: Vec<(usize, Vec<HostMark>)> },
+    /// Remove every mark of `set` from the tagged document.
+    ClearMarks { tag: String, set: String },
+}
+
+/// A host's mark: an underline drawn above the page under each of `rects` (page view space,
+/// `[x0, y0, x1, y1]`) in `color`. Marks are the host's overlay, never part of the document:
+/// they are not annotations, are never saved, never make the document dirty and never enter
+/// undo. They follow zoom, rotation and scrolling, stay while the tab is in the background, and
+/// go when the document closes.
+///
+/// A mark's index is its position among its page's marks of its set, in the order sent; a mark
+/// whose rectangles are all invalid (not finite, or with a negative size) keeps its index but
+/// draws nothing and can't be clicked. At most [`MAX_HOST_MARKS_PER_PAGE`] marks per page and
+/// set, [`MAX_HOST_MARK_RECTS`] rectangles per mark and [`MAX_HOST_MARK_RECTS_TOTAL`] per document
+/// are kept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostMark {
+    pub rects: Vec<[f32; 4]>,
+    pub color: egui::Color32,
 }
 
 /// An item the host adds to PdfCraft's own text-selection menus (the right-click menu and the
@@ -123,6 +160,15 @@ pub enum HostEvent {
     /// page of the match, or the page asked for when there is none; `query` the passage as looked
     /// for (spaces collapsed, cut to [`MAX_HOST_FIND_CHARS`]).
     Found { tag: String, page: usize, query: String, found: bool },
+    /// A primary click (press and release without a drag) with the Select or Hand tool landed on
+    /// a [`HostMark`] (its rectangles, 2 points around). `index` is the mark's index on `page` in
+    /// `set`; `rect` the union of its rectangles on screen (egui points). Where sets overlap, the
+    /// one changed last wins. The click still does what it always does.
+    MarkClick { tag: String, set: String, index: usize, page: usize, rect: [f32; 4] },
+    /// The marks of `set` on `page` were drawn for the first time since they last changed:
+    /// `count` is how many that page holds (as indexed). Once per change, when the page is first
+    /// on screen afterwards.
+    MarksShown { tag: String, set: String, page: usize, count: usize },
 }
 
 /// Receives [`HostEvent`]s (set by the host).
@@ -312,6 +358,177 @@ pub(crate) fn selection_menu_items(ui: &mut egui::Ui, view: &DocView, row: bool)
     was_clicked
 }
 
+/// A document's [`HostMark`]s, kept on its view (see [`HostRequest::Marks`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DocMarks {
+    /// The sets, the one changed last at the end: drawn last (on top) and first to take a click.
+    sets: Vec<MarkSet>,
+    /// Rectangles held over all sets and pages, against [`MAX_HOST_MARK_RECTS_TOTAL`].
+    rects: usize,
+    /// Pages drawn for the first time since their marks changed: set, page and mark count.
+    shown: Vec<(String, usize, usize)>,
+    /// The last click on a mark, for the next [`HostState`] update.
+    click: Option<MarkHit>,
+}
+
+#[derive(Clone, Debug)]
+struct MarkSet {
+    name: String,
+    pages: BTreeMap<usize, PageMarks>,
+}
+
+#[derive(Clone, Debug)]
+struct PageMarks {
+    marks: Vec<HostMark>,
+    /// Drawn since it last changed (reported through [`HostEvent::MarksShown`]).
+    shown: bool,
+}
+
+impl PageMarks {
+    fn rect_count(&self) -> usize {
+        self.marks.iter().map(|m| m.rects.len()).sum()
+    }
+}
+
+/// A click on a mark: the set, the mark's index, the page and the mark on screen.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MarkHit {
+    pub(crate) set: String,
+    pub(crate) index: usize,
+    pub(crate) page: usize,
+    pub(crate) rect: [f32; 4],
+}
+
+/// A finite rectangle with no negative side, as `[x0, y0, x1, y1]`.
+fn valid_mark_rect(r: &[f32; 4]) -> bool {
+    r.iter().all(|v| v.is_finite()) && r[2] >= r[0] && r[3] >= r[1]
+}
+
+impl DocMarks {
+    /// Whether the document holds no marks.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    /// See [`HostRequest::Marks`]; `page_count` bounds the pages.
+    pub(crate) fn set(&mut self, name: String, pages: Vec<(usize, Vec<HostMark>)>, page_count: usize) {
+        if name.is_empty() {
+            return;
+        }
+        let mut set = match self.sets.iter().position(|s| s.name == name) {
+            Some(at) => self.sets.remove(at),
+            None if self.sets.len() >= MAX_HOST_MARK_SETS => return,
+            None => MarkSet { name, pages: BTreeMap::new() },
+        };
+        for (page, marks) in pages {
+            if page >= page_count {
+                continue;
+            }
+            if let Some(old) = set.pages.remove(&page) {
+                self.rects = self.rects.saturating_sub(old.rect_count());
+            }
+            let mut kept = Vec::with_capacity(marks.len().min(MAX_HOST_MARKS_PER_PAGE));
+            for mark in marks.into_iter().take(MAX_HOST_MARKS_PER_PAGE) {
+                let room = MAX_HOST_MARK_RECTS_TOTAL.saturating_sub(self.rects).min(MAX_HOST_MARK_RECTS);
+                let rects: Vec<[f32; 4]> = mark.rects.into_iter().filter(valid_mark_rect).take(room).collect();
+                self.rects = self.rects.saturating_add(rects.len());
+                kept.push(HostMark { rects, color: mark.color });
+            }
+            if kept.iter().any(|m| !m.rects.is_empty()) {
+                set.pages.insert(page, PageMarks { marks: kept, shown: false });
+            }
+        }
+        if !set.pages.is_empty() {
+            self.sets.push(set);
+        }
+    }
+
+    /// See [`HostRequest::ClearMarks`].
+    pub(crate) fn clear(&mut self, name: &str) {
+        if let Some(at) = self.sets.iter().position(|s| s.name == name) {
+            let set = self.sets.remove(at);
+            let gone: usize = set.pages.values().map(PageMarks::rect_count).sum();
+            self.rects = self.rects.saturating_sub(gone);
+        }
+    }
+
+    /// The marks of `set` on `page`, as held (for tests and inspection).
+    #[cfg(test)]
+    fn page(&self, set: &str, page: usize) -> Option<&[HostMark]> {
+        self.sets.iter().find(|s| s.name == set)?.pages.get(&page).map(|p| p.marks.as_slice())
+    }
+
+    /// Underline the marks of `page` (on screen, through `xf`), the last set changed on top. A
+    /// line is `width` points thick, just under each rectangle's bottom as the page is read (so
+    /// it turns with the view). Records the sets drawn for the first time since they changed.
+    pub(crate) fn paint(&mut self, painter: &egui::Painter, xf: &crate::canvas::PageXform, page: usize, width: f32) {
+        let zoom = xf.zoom();
+        if !(zoom.is_finite() && zoom > 0.0 && width.is_finite() && width > 0.0) {
+            return;
+        }
+        // Half a point of air under the glyphs, then the line's own half thickness (page points).
+        let drop = (0.5 + width / 2.0) / zoom;
+        let to_screen = |x: f32, y: f32| xf.norm_to_screen(x / xf.pw, y / xf.ph);
+        for set in &mut self.sets {
+            let Some(marks) = set.pages.get_mut(&page) else { continue };
+            for mark in &marks.marks {
+                let stroke = egui::Stroke::new(width, mark.color);
+                for r in &mark.rects {
+                    let y = r[3] + drop;
+                    painter.line_segment([to_screen(r[0], y), to_screen(r[2], y)], stroke);
+                }
+            }
+            if !marks.shown {
+                marks.shown = true;
+                self.shown.push((set.name.clone(), page, marks.marks.len()));
+                // Reported by the next frame's update.
+                painter.ctx().request_repaint();
+            }
+        }
+    }
+
+    /// The mark under the view-space point `(vx, vy)` of `page`: the last set changed first,
+    /// then the lowest index. Its rectangle is the union of the mark's rectangles (view space).
+    pub(crate) fn hit(&self, page: usize, (vx, vy): (f32, f32)) -> Option<(String, usize, [f32; 4])> {
+        for set in self.sets.iter().rev() {
+            let Some(marks) = set.pages.get(&page) else { continue };
+            for (index, mark) in marks.marks.iter().enumerate() {
+                let inside = mark
+                    .rects
+                    .iter()
+                    .any(|r| vx >= r[0] - MARK_HIT_SLOP && vx <= r[2] + MARK_HIT_SLOP && vy >= r[1] - MARK_HIT_SLOP && vy <= r[3] + MARK_HIT_SLOP);
+                if !inside {
+                    continue;
+                }
+                let union = mark.rects.iter().fold([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY], |u, r| {
+                    [u[0].min(r[0]), u[1].min(r[1]), u[2].max(r[2]), u[3].max(r[3])]
+                });
+                return Some((set.name.clone(), index, union));
+            }
+        }
+        None
+    }
+
+    /// Remember a click on a mark for the next update to report.
+    pub(crate) fn clicked(&mut self, hit: MarkHit) {
+        self.click = Some(hit);
+    }
+
+    fn take_events(&mut self) -> (Vec<(String, usize, usize)>, Option<MarkHit>) {
+        (std::mem::take(&mut self.shown), self.click.take())
+    }
+}
+
+/// The underline thickness in egui points: [`MARK_LINE_CSS_PX`] CSS pixels. The display's own
+/// ratio (`native_pixels_per_point`, the browser's device pixel ratio on the web) over the points'
+/// size in pixels, so PdfCraft's interface scale doesn't thicken it.
+pub(crate) fn mark_line_width(ctx: &egui::Context) -> f32 {
+    let ppp = ctx.pixels_per_point();
+    let native = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(ppp);
+    let width = MARK_LINE_CSS_PX * native / ppp;
+    if width.is_finite() { width.clamp(0.5, 8.0) } else { MARK_LINE_CSS_PX }
+}
+
 struct PendingOpen {
     tag: String,
     page: Option<usize>,
@@ -448,8 +665,23 @@ impl PdfCraftApp {
                     }
                 }
                 HostRequest::Goto { tag, page, find } => self.host_goto(ctx, tag, page, find),
+                HostRequest::Marks { tag, set, pages } => {
+                    let Some(index) = self.view_with_tag(&tag) else { continue };
+                    let count = self.views.get(index).and_then(|v| self.session.get(v.id)).map_or(0, |d| d.info.pages.len());
+                    if let Some(view) = self.views.get_mut(index) {
+                        view.host_marks.set(set, pages, count);
+                    }
+                    ctx.request_repaint();
+                }
+                HostRequest::ClearMarks { tag, set } => {
+                    if let Some(view) = self.view_with_tag(&tag).and_then(|i| self.views.get_mut(i)) {
+                        view.host_marks.clear(&set);
+                    }
+                    ctx.request_repaint();
+                }
             }
         }
+        self.report_marks();
         self.resolve_goto(ctx);
         let saves = std::mem::take(&mut self.host.deferred_saves);
         for tag in saves {
@@ -521,6 +753,24 @@ impl PdfCraftApp {
         {
             self.host.page = Some(page);
             self.emit(HostEvent::Page { tag, page });
+        }
+    }
+
+    /// Report the clicks on marks and the marks drawn since the last frame.
+    fn report_marks(&mut self) {
+        let mut events = Vec::new();
+        for view in &mut self.views {
+            let (shown, click) = view.host_marks.take_events();
+            let Some(tag) = self.host.tags.get(&view.id) else { continue };
+            for (set, page, count) in shown {
+                events.push(HostEvent::MarksShown { tag: tag.clone(), set, page, count });
+            }
+            if let Some(MarkHit { set, index, page, rect }) = click {
+                events.push(HostEvent::MarkClick { tag: tag.clone(), set, index, page, rect });
+            }
+        }
+        for event in events {
+            self.emit(event);
         }
     }
 
@@ -710,5 +960,132 @@ impl PdfCraftApp {
         }
         let query = goto.queries.into_iter().next().unwrap_or_default();
         self.emit(HostEvent::Found { tag: goto.tag, page: found_on.unwrap_or(goto.page), query, found: found_on.is_some() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CORAL: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x5a, 0x30);
+
+    fn mark(rects: &[[f32; 4]]) -> HostMark {
+        HostMark { rects: rects.to_vec(), color: CORAL }
+    }
+
+    fn word(x: f32) -> HostMark {
+        mark(&[[x, 100.0, x + 30.0, 112.0]])
+    }
+
+    fn rects_of(m: &DocMarks, set: &str, page: usize) -> Vec<Vec<[f32; 4]>> {
+        m.page(set, page).map(|p| p.iter().map(|m| m.rects.clone()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn marks_replace_only_the_pages_sent() {
+        let mut m = DocMarks::default();
+        m.set("vocab".into(), vec![(0, vec![word(10.0), word(50.0)]), (2, vec![word(10.0)])], 5);
+        assert_eq!(rects_of(&m, "vocab", 0).len(), 2);
+        assert_eq!(m.rects, 3);
+        // Page 0 is replaced, page 2 stays.
+        m.set("vocab".into(), vec![(0, vec![word(90.0)])], 5);
+        assert_eq!(rects_of(&m, "vocab", 0), [vec![[90.0, 100.0, 120.0, 112.0]]]);
+        assert_eq!(rects_of(&m, "vocab", 2).len(), 1);
+        assert_eq!(m.rects, 2);
+        // An empty page entry clears the page; the set goes once it has no page left.
+        m.set("vocab".into(), vec![(0, vec![])], 5);
+        assert!(m.page("vocab", 0).is_none());
+        m.set("vocab".into(), vec![(2, vec![mark(&[])])], 5);
+        assert!(m.is_empty());
+        assert_eq!(m.rects, 0);
+        // Pages past the end are ignored.
+        m.set("vocab".into(), vec![(5, vec![word(0.0)]), (usize::MAX, vec![word(0.0)])], 5);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn clear_removes_one_set_and_its_rect_budget() {
+        let mut m = DocMarks::default();
+        m.set("a".into(), vec![(0, vec![word(0.0)]), (1, vec![word(0.0)])], 2);
+        m.set("b".into(), vec![(0, vec![word(0.0)])], 2);
+        m.clear("a");
+        assert!(m.page("a", 0).is_none() && m.page("a", 1).is_none());
+        assert_eq!(rects_of(&m, "b", 0).len(), 1);
+        assert_eq!(m.rects, 1);
+        m.clear("nope");
+        m.clear("b");
+        assert!(m.is_empty());
+        assert_eq!(m.rects, 0);
+    }
+
+    #[test]
+    fn invalid_rects_are_dropped_but_their_mark_keeps_its_index() {
+        let mut m = DocMarks::default();
+        let bad = mark(&[[f32::NAN, 0.0, 1.0, 1.0], [0.0, f32::INFINITY, 1.0, 1.0], [5.0, 0.0, 4.0, 1.0], [0.0, 5.0, 1.0, 4.0]]);
+        m.set("v".into(), vec![(0, vec![bad, word(40.0)])], 1);
+        assert_eq!(rects_of(&m, "v", 0), [vec![], vec![[40.0, 100.0, 70.0, 112.0]]]);
+        let hit = m.hit(0, (50.0, 105.0)).map(|h| h.1);
+        assert_eq!(hit, Some(1), "the second mark is still index 1");
+    }
+
+    #[test]
+    fn limits_hold() {
+        let mut m = DocMarks::default();
+        for i in 0..MAX_HOST_MARK_SETS + 3 {
+            m.set(format!("s{i}"), vec![(0, vec![word(0.0)])], 1);
+        }
+        assert_eq!(m.sets.len(), MAX_HOST_MARK_SETS);
+        assert!(m.page(&format!("s{}", MAX_HOST_MARK_SETS), 0).is_none(), "a seventeenth set is ignored");
+        // An existing set can still change.
+        m.set("s0".into(), vec![(0, vec![word(1.0), word(2.0)])], 1);
+        assert_eq!(rects_of(&m, "s0", 0).len(), 2);
+
+        let mut m = DocMarks::default();
+        let many: Vec<[f32; 4]> = (0..20).map(|i| [i as f32, 0.0, i as f32 + 1.0, 1.0]).collect();
+        m.set("v".into(), vec![(0, vec![mark(&many)])], 1);
+        assert_eq!(rects_of(&m, "v", 0)[0].len(), MAX_HOST_MARK_RECTS);
+        let lots: Vec<HostMark> = (0..MAX_HOST_MARKS_PER_PAGE + 10).map(|i| word(i as f32)).collect();
+        m.set("v".into(), vec![(0, lots)], 1);
+        assert_eq!(rects_of(&m, "v", 0).len(), MAX_HOST_MARKS_PER_PAGE);
+
+        // The document-wide budget: 60 pages × 4 000 marks × 1 rect > 200 000.
+        let mut m = DocMarks::default();
+        let pages: Vec<(usize, Vec<HostMark>)> = (0..60).map(|p| (p, (0..MAX_HOST_MARKS_PER_PAGE).map(|i| word(i as f32)).collect())).collect();
+        m.set("v".into(), pages, 60);
+        assert_eq!(m.rects, MAX_HOST_MARK_RECTS_TOTAL);
+        let held: usize = (0..60).map(|p| rects_of(&m, "v", p).iter().map(Vec::len).sum::<usize>()).sum();
+        assert_eq!(held, MAX_HOST_MARK_RECTS_TOTAL);
+        // Clearing frees the budget for another set.
+        m.clear("v");
+        m.set("w".into(), vec![(0, vec![word(0.0)])], 60);
+        assert_eq!(m.rects, 1);
+    }
+
+    #[test]
+    fn hits_inflate_by_two_points_and_the_last_set_changed_wins() {
+        let mut m = DocMarks::default();
+        m.set("a".into(), vec![(0, vec![word(10.0), mark(&[[100.0, 100.0, 130.0, 112.0], [10.0, 120.0, 40.0, 132.0]])])], 1);
+        assert_eq!(m.hit(0, (20.0, 106.0)), Some(("a".into(), 0, [10.0, 100.0, 40.0, 112.0])));
+        assert_eq!(m.hit(0, (8.5, 113.5)).map(|h| h.1), Some(0), "within 2 points");
+        assert_eq!(m.hit(0, (7.0, 106.0)), None, "past 2 points");
+        assert_eq!(m.hit(0, (20.0, 125.0)), Some(("a".into(), 1, [10.0, 100.0, 130.0, 132.0])), "a mark's union of rectangles");
+        assert_eq!(m.hit(1, (20.0, 106.0)), None, "another page");
+
+        m.set("b".into(), vec![(0, vec![word(15.0)])], 1);
+        assert_eq!(m.hit(0, (20.0, 106.0)).map(|h| (h.0, h.1)), Some(("b".into(), 0)));
+        // Changing "a" brings it back on top.
+        m.set("a".into(), vec![(0, vec![word(10.0)])], 1);
+        assert_eq!(m.hit(0, (20.0, 106.0)).map(|h| h.0), Some("a".into()));
+        m.clear("a");
+        assert_eq!(m.hit(0, (20.0, 106.0)).map(|h| h.0), Some("b".into()));
+    }
+
+    #[test]
+    fn hits_survive_hostile_points() {
+        let mut m = DocMarks::default();
+        m.set("a".into(), vec![(0, vec![word(10.0)])], 1);
+        for p in [(f32::NAN, 0.0), (f32::INFINITY, f32::NEG_INFINITY), (f32::MAX, f32::MIN)] {
+            assert_eq!(m.hit(0, p), None);
+        }
     }
 }

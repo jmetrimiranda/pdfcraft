@@ -1,13 +1,17 @@
 //! The host hooks (`host_inbox`, `host_requests`, `host_events`, `host_save`,
 //! `host_menu_items`) that the web build's `?host=parent` bridge drives: tagged opens, saves and
-//! gotos asked for by the host, its items in the text-selection menus, and the events it hears.
+//! gotos asked for by the host, its items in the text-selection menus, its marks over the pages,
+//! and the events it hears.
 
 use std::sync::{Arc, Mutex};
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use pdfcraft_testkit::Pdf;
-use pdfcraft_ui_egui::{HostEvent, HostMenuItem, HostOpen, HostRequest, HostSave, MAX_HOST_FIND_CHARS, MAX_HOST_TEXT_CHARS, PdfCraftApp};
+use pdfcraft_ui_egui::{
+    HostEvent, HostMark, HostMenuItem, HostOpen, HostRequest, HostSave, MAX_HOST_FIND_CHARS, MAX_HOST_MARK_RECTS_TOTAL, MAX_HOST_TEXT_CHARS,
+    PdfCraftApp,
+};
 
 /// An `n`-page document; page `i` shows "Page i+1".
 fn fixture(n: usize) -> Vec<u8> {
@@ -647,4 +651,254 @@ fn goto_on_a_document_without_pages_answers_without_panicking() {
     let found: Vec<HostEvent> = host.take().into_iter().filter(is_found).collect();
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(matches!(&found[0], HostEvent::Found { found: false, .. }));
+}
+
+// Marks: the host's temporary underlines over the pages.
+
+const CORAL: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x5a, 0x30);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xba, 0x75, 0x17);
+
+/// "The" on the first line of a [`text_book`] page (view space): 14-point Helvetica set at
+/// x 20, baseline 30 points from the top.
+const THE: [f32; 4] = [20.0, 18.0, 45.0, 33.0];
+/// "dog" at the end of the second line, far from "The".
+const DOG: [f32; 4] = [110.0, 38.0, 140.0, 53.0];
+
+fn underline(rects: &[[f32; 4]], color: egui::Color32) -> HostMark {
+    HostMark { rects: rects.to_vec(), color }
+}
+
+fn is_mark_event(e: &HostEvent) -> bool {
+    matches!(e, HostEvent::MarkClick { .. } | HostEvent::MarksShown { .. })
+}
+
+impl Host {
+    fn marks(&mut self, tag: &str, set: &str, pages: Vec<(usize, Vec<HostMark>)>) {
+        self.h.state().host_requests.lock().unwrap().push(HostRequest::Marks { tag: tag.into(), set: set.into(), pages });
+        self.h.run_steps(3);
+    }
+
+    fn clear_marks(&mut self, tag: &str, set: &str) {
+        self.h.state().host_requests.lock().unwrap().push(HostRequest::ClearMarks { tag: tag.into(), set: set.into() });
+        self.h.run_steps(3);
+    }
+
+    /// A primary click (press and release in place) at `pos`.
+    fn click_at(&mut self, pos: egui::Pos2) {
+        self.h.hover_at(pos);
+        self.h.run_steps(1);
+        for pressed in [true, false] {
+            self.h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+            self.h.run_steps(1);
+        }
+        self.h.run_steps(3);
+    }
+
+    /// The screen position of the first glyph of "The" (inside [`THE`]) on `page` of tab 0.
+    fn the_pos(&mut self, page: usize) -> egui::Pos2 {
+        self.wait_text(0, page);
+        self.h.state().views[0].glyph_screen_pos(page, 0).unwrap()
+    }
+
+    fn mark_clicks(&self) -> Vec<HostEvent> {
+        self.take().into_iter().filter(|e| matches!(e, HostEvent::MarkClick { .. })).collect()
+    }
+}
+
+#[test]
+fn marks_are_drawn_once_per_change_and_reported() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES, TWO_LINES]));
+    host.wait_text(0, 0);
+    host.take();
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[THE], CORAL), underline(&[DOG], AMBER)])]);
+    let shown = host.wait_event("MarksShown", |e| matches!(e, HostEvent::MarksShown { .. }));
+    assert_eq!(shown, HostEvent::MarksShown { tag: "book-a".into(), set: "vocab".into(), page: 0, count: 2 });
+    host.h.run_steps(5);
+    let again: Vec<HostEvent> = host.take().into_iter().filter(is_mark_event).collect();
+    assert_eq!(again.len(), 1, "once per change, not every frame: {again:?}");
+
+    // A change to page 0 is reported again; page 1 is reported when it is drawn.
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.h.run_steps(2);
+    assert!(host.take().contains(&HostEvent::MarksShown { tag: "book-a".into(), set: "vocab".into(), page: 0, count: 1 }));
+}
+
+#[test]
+fn a_click_on_a_mark_is_reported_and_the_click_goes_on() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = host.the_pos(0);
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[DOG], AMBER), underline(&[THE], CORAL)])]);
+    assert!(host.h.state_mut().views[0].select_all());
+    host.h.run_steps(2);
+    host.take();
+
+    host.click_at(at);
+    let clicks = host.mark_clicks();
+    assert_eq!(clicks.len(), 1, "{clicks:?}");
+    let HostEvent::MarkClick { tag, set, index, page, rect } = &clicks[0] else { unreachable!() };
+    assert_eq!((tag.as_str(), set.as_str(), *index, *page), ("book-a", "vocab", 1, 0), "index in the order sent");
+    assert!(rect[0] < rect[2] && rect[1] < rect[3], "{rect:?}");
+    assert!(
+        egui::Rect::from_min_max(egui::pos2(rect[0], rect[1]), egui::pos2(rect[2], rect[3])).contains(at),
+        "on screen, around the click: {rect:?}"
+    );
+    assert!(host.h.state().views[0].selected_text().is_none(), "the click still clears the selection, as any click does");
+
+    // Away from any mark: nothing.
+    let away = at + egui::vec2(0.0, 300.0);
+    host.click_at(away);
+    assert!(host.mark_clicks().is_empty());
+}
+
+#[test]
+fn a_drag_over_a_mark_selects_text_and_is_not_a_click() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = host.the_pos(0);
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.take();
+    host.h.hover_at(at);
+    host.h.run_steps(1);
+    host.h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    host.h.run_steps(1);
+    for dx in [10.0, 40.0, 80.0] {
+        host.h.hover_at(at + egui::vec2(dx, 0.0));
+        host.h.run_steps(1);
+    }
+    let end = at + egui::vec2(80.0, 0.0);
+    host.h.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    host.h.run_steps(3);
+    assert!(host.mark_clicks().is_empty());
+    assert!(host.h.state().views[0].selected_text().is_some_and(|t| t.starts_with("The")), "the drag selected text as usual");
+}
+
+#[test]
+fn overlapping_sets_go_to_the_one_changed_last_and_cleared_sets_stop_answering() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = host.the_pos(0);
+    host.marks("book-a", "first", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.marks("book-a", "second", vec![(0, vec![underline(&[DOG], AMBER), underline(&[THE], AMBER)])]);
+    host.take();
+    host.click_at(at);
+    assert!(matches!(&host.mark_clicks()[..], [HostEvent::MarkClick { set, index: 1, .. }] if set == "second"));
+
+    host.marks("book-a", "first", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.take();
+    host.click_at(at);
+    assert!(matches!(&host.mark_clicks()[..], [HostEvent::MarkClick { set, index: 0, .. }] if set == "first"));
+
+    host.clear_marks("book-a", "first");
+    host.take();
+    host.click_at(at);
+    assert!(matches!(&host.mark_clicks()[..], [HostEvent::MarkClick { set, .. }] if set == "second"));
+    host.clear_marks("book-a", "second");
+    host.take();
+    host.click_at(at);
+    assert!(host.mark_clicks().is_empty());
+}
+
+#[test]
+fn marks_only_answer_the_select_and_hand_tools() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = host.the_pos(0);
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.h.state_mut().quick_tool = pdfcraft_ui_egui::QuickTool::Hand;
+    host.h.run_steps(2);
+    host.take();
+    host.click_at(at);
+    assert_eq!(host.mark_clicks().len(), 1, "the Hand tool reads, it doesn't make anything");
+    host.h.state_mut().quick_tool = pdfcraft_ui_egui::QuickTool::Stamp(pdfcraft_engine::StampKind::DynApproved);
+    host.h.run_steps(2);
+    host.take();
+    host.click_at(at);
+    assert!(host.mark_clicks().is_empty(), "a click that makes content is the tool's");
+}
+
+#[test]
+fn marks_are_never_part_of_the_document() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    host.wait_text(0, 0);
+    host.request(HostRequest::Save { tag: "book-a".into() });
+    let before = std::mem::take(&mut *host.saves.lock().unwrap()).pop().unwrap().bytes;
+
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[THE], CORAL), underline(&[DOG], AMBER)])]);
+    host.wait_event("MarksShown", |e| matches!(e, HostEvent::MarksShown { .. }));
+    let id = host.h.state().views[0].id;
+    {
+        let app = host.h.state();
+        let doc = app.session.get(id).unwrap();
+        assert!(!doc.dirty, "marks don't make the document dirty");
+        assert!(doc.can_undo().is_none() && doc.can_redo().is_none(), "nor enter undo");
+        assert!(app.first_dirty().is_none());
+    }
+    assert!(!host.take().iter().any(|e| matches!(e, HostEvent::Dirty { any: true, .. })));
+    host.request(HostRequest::Save { tag: "book-a".into() });
+    let after = std::mem::take(&mut *host.saves.lock().unwrap()).pop().unwrap().bytes;
+    assert_eq!(before, after, "the saved file is the same with marks as without");
+}
+
+#[test]
+fn marks_stay_behind_other_tabs_and_go_with_their_document() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = host.the_pos(0);
+    host.marks("book-a", "vocab", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.open(Some("book-b"), None, text_book(&[TWO_LINES]));
+    assert_eq!(host.h.state().active, Some(1));
+    host.take();
+    host.click_at(at);
+    assert!(host.mark_clicks().is_empty(), "book-b has no marks");
+
+    host.h.state_mut().active = Some(0);
+    host.h.run_steps(3);
+    host.take();
+    host.click_at(at);
+    assert!(matches!(&host.mark_clicks()[..], [HostEvent::MarkClick { tag, .. }] if tag == "book-a"), "kept while book-b was in front");
+
+    host.h.state_mut().close_tab(0);
+    host.h.run_steps(2);
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = {
+        let index = host.h.state().active.unwrap();
+        crate::support::wait_until(&mut host.h, "the page's text layer", move |app| app.views[index].glyph_screen_pos(0, 0).is_some());
+        host.h.state().views[index].glyph_screen_pos(0, 0).unwrap()
+    };
+    host.take();
+    host.click_at(at);
+    assert!(host.mark_clicks().is_empty(), "closing the document dropped its marks");
+}
+
+#[test]
+fn bad_mark_requests_never_panic() {
+    let mut host = Host::new();
+    host.open(Some("book-a"), None, text_book(&[TWO_LINES]));
+    let at = host.the_pos(0);
+    host.take();
+    // Unknown tags, pages past the end, hostile rectangles and an empty set name.
+    host.marks("nope", "vocab", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.clear_marks("nope", "vocab");
+    host.marks("book-a", "", vec![(0, vec![underline(&[THE], CORAL)])]);
+    host.marks(
+        "book-a",
+        "vocab",
+        vec![
+            (99, vec![underline(&[THE], CORAL)]),
+            (usize::MAX, vec![underline(&[THE], CORAL)]),
+            (0, vec![underline(&[[f32::NAN, 0.0, 1.0, 1.0], [50.0, 50.0, 10.0, 10.0], [f32::MIN, f32::MIN, f32::MAX, f32::MAX]], CORAL)]),
+        ],
+    );
+    host.click_at(at);
+    // The huge rectangle is valid and covers the page: the click lands on mark 0.
+    assert!(matches!(&host.mark_clicks()[..], [HostEvent::MarkClick { index: 0, page: 0, .. }]));
+    // The whole budget on one page set of a one-page book: capped, and still drawn.
+    host.take();
+    let lots: Vec<HostMark> = (0..10_000).map(|i| underline(&[[i as f32 / 100.0, 18.0, i as f32 / 100.0 + 1.0, 33.0]; 8], CORAL)).collect();
+    host.marks("book-a", "vocab", vec![(0, lots)]);
+    let shown = host.wait_event("MarksShown", |e| matches!(e, HostEvent::MarksShown { .. }));
+    assert!(matches!(shown, HostEvent::MarksShown { count, .. } if count <= MAX_HOST_MARK_RECTS_TOTAL));
 }

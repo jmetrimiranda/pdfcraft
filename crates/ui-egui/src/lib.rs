@@ -161,8 +161,8 @@ pub use canvas::{DocView, RasterMemory};
 pub use editing::{CloseRequest, SaveTarget};
 pub use files::{ExtractDraft, FilePurpose, FileRequest, RotateDraft, SplitDraft, SplitMode, SplitPlan};
 pub use host::{
-    HostEvent, HostEventFn, HostInbox, HostMenuItem, HostMenuItems, HostOpen, HostRequest, HostRequests, HostSave, MAX_HOST_FIND_CHARS,
-    MAX_HOST_RECTS, MAX_HOST_TEXT_CHARS,
+    HostEvent, HostEventFn, HostInbox, HostMark, HostMenuItem, HostMenuItems, HostOpen, HostRequest, HostRequests, HostSave, MAX_HOST_FIND_CHARS,
+    MAX_HOST_MARK_RECTS, MAX_HOST_MARK_RECTS_TOTAL, MAX_HOST_MARK_SETS, MAX_HOST_MARKS_PER_PAGE, MAX_HOST_RECTS, MAX_HOST_TEXT_CHARS,
 };
 pub use recovery::{AUTOSAVE_SECS, RecoveryMeta, RecoveryStore};
 use theme::{ThemeKind, ThemePreference};

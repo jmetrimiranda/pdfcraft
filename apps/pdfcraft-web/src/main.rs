@@ -172,12 +172,27 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// - `pdfcraft:selection-now` `{ seq? }` (level 2): send the selection waiting for its 300 ms
 ///   now, once the input that came before this message has been drawn (a shortcut pressed right
 ///   after selecting), then answer `pdfcraft:selection-sent`.
+/// - `pdfcraft:marks` `{ id, set, marks: [{ page, rects, style, color }] }` (level 3): the
+///   parent's own temporary marks over the tab with that id, as a 2 CSS-pixel underline under
+///   each rectangle (`[x, y, width, height]` on the page, as in `pdfcraft:selection`). `set` (1–64
+///   characters) names a group of marks the parent changes together. For each page in `marks`, the
+///   set's marks on that page are replaced by that page's entries, in order (an entry with
+///   `rects: []` alone clears the page); other pages keep theirs. A mark's index is its position
+///   among its page's entries. `style` is `"underline"` (the default; an entry with any other
+///   keeps its index but draws nothing), `color` `#rrggbb` or `#rrggbbaa` (otherwise coral,
+///   `#d85a30`). Rectangles that aren't finite or have a negative side are dropped, entries
+///   without a whole page or past the page count are ignored, and so is an unknown `id`. At most
+///   16 sets per tab, 4 000 marks per page and set, 8 rectangles per mark and 200 000 per tab are
+///   kept. Marks are drawn above the page and its comments, below PdfCraft's own selection and
+///   menus; they are never saved, never make the document dirty, never enter undo, stay while
+///   another tab is in front and go when the tab closes. The set changed last is drawn on top.
+/// - `pdfcraft:clear-marks` `{ id, set }` (level 3): remove every mark of `set` from that tab.
 ///
 /// To the parent:
 ///
 /// - `pdfcraft:ready` `{ version, bridge }`: the app is listening; send files now. `bridge` is
-///   the protocol level (2: everything listed here; 1: without the messages marked level 2),
-///   absent in builds before it.
+///   the protocol level (3: everything listed here; 2: without the messages marked level 3; 1:
+///   without those marked level 2 or 3), absent in builds before it.
 /// - `pdfcraft:save` `{ name, saveAs, bytes, id }` when a tab is saved (by the user, the
 ///   unsaved-changes prompt or `pdfcraft:request-save`); `bytes` is a transferred `ArrayBuffer`,
 ///   `id` the tab's id or `null`. The parent stores the file and reports its own errors. If the
@@ -218,6 +233,16 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// - `pdfcraft:found` `{ id, page, query, found }`: how a `pdfcraft:goto` went. `page` is the
 ///   page of the match, or the page asked for when there is none; `query` the passage as looked
 ///   for (spaces collapsed).
+///
+/// Level 3 adds:
+///
+/// - `pdfcraft:mark-click` `{ id, set, index, page, rect }` when a primary click (press and
+///   release, no drag) with the Select or Hand tool lands on one of the parent's marks (its
+///   rectangles, 2 points around); `rect` is the union of the mark's rectangles on screen. Where
+///   sets overlap, the set changed last wins. The click still does what it always does.
+/// - `pdfcraft:marks-shown` `{ id, set, page, count }` once the marks of `set` on `page` have been
+///   drawn after they changed (when the page is first on screen afterwards); `count` is the
+///   number of marks that page holds in the set, as indexed.
 #[cfg(target_arch = "wasm32")]
 mod host {
     use std::cell::RefCell;
@@ -230,7 +255,7 @@ mod host {
     use crate::bridge::{Debounce, Fire};
 
     /// The protocol level sent with `pdfcraft:ready`.
-    const BRIDGE_LEVEL: u32 = 2;
+    const BRIDGE_LEVEL: u32 = 3;
     /// `pdfcraft:page` is sent at most this often (ms).
     const PAGE_INTERVAL_MS: i32 = 250;
     /// `pdfcraft:activity` is sent at most this often per id (ms).
@@ -405,6 +430,29 @@ mod host {
                             q.push(HostRequest::Goto { tag, page, find });
                         }
                     }
+                    Some("pdfcraft:marks") => {
+                        let (Some(tag), Some(set)) = (id, string(&data, "set").and_then(|s| crate::bridge::mark_set(&s))) else {
+                            eframe::web_sys::console::warn_1(&"PdfCraft: ignored pdfcraft:marks without an id and a set".into());
+                            return;
+                        };
+                        let Ok(list) = js_sys::Reflect::get(&data, &JsValue::from_str("marks")) else { return };
+                        if !js_sys::Array::is_array(&list) {
+                            eframe::web_sys::console::warn_1(&"PdfCraft: ignored pdfcraft:marks without a marks array".into());
+                            return;
+                        }
+                        let entries =
+                            js_sys::Array::from(&list).iter().take(crate::bridge::MAX_MARK_ENTRIES).map(|e| mark_entry(&e)).collect::<Vec<_>>();
+                        let pages = crate::bridge::marks(entries);
+                        if let Ok(mut q) = requests.lock() {
+                            q.push(HostRequest::Marks { tag, set, pages });
+                        }
+                    }
+                    Some("pdfcraft:clear-marks") => {
+                        let (Some(tag), Some(set)) = (id, string(&data, "set").and_then(|s| crate::bridge::mark_set(&s))) else { return };
+                        if let Ok(mut q) = requests.lock() {
+                            q.push(HostRequest::ClearMarks { tag, set });
+                        }
+                    }
                     Some("pdfcraft:selection-now") => {
                         let seq =
                             js_sys::Reflect::get(&data, &JsValue::from_str("seq")).ok().and_then(|s| s.as_f64()).and_then(crate::bridge::request_seq);
@@ -546,6 +594,25 @@ mod host {
                         ("found", found.into()),
                     ]);
                 }
+                HostEvent::MarkClick { tag, set, index, page, rect } => {
+                    self.send(&[
+                        ("type", "pdfcraft:mark-click".into()),
+                        ("id", tag.as_str().into()),
+                        ("set", set.as_str().into()),
+                        ("index", number(index)),
+                        ("page", number(page)),
+                        ("rect", self.screen_rect(rect, ctx)),
+                    ]);
+                }
+                HostEvent::MarksShown { tag, set, page, count } => {
+                    self.send(&[
+                        ("type", "pdfcraft:marks-shown".into()),
+                        ("id", tag.as_str().into()),
+                        ("set", set.as_str().into()),
+                        ("page", number(page)),
+                        ("count", number(count)),
+                    ]);
+                }
                 // Events of a later protocol level.
                 _ => {}
             }
@@ -678,6 +745,38 @@ mod host {
             Some(js_sys::Uint8Array::new(&bytes).to_vec())
         } else {
             None
+        }
+    }
+
+    /// One entry of `pdfcraft:marks` (see [`crate::bridge::MarkEntry`]); rectangles past the
+    /// eighth aren't read.
+    fn mark_entry(entry: &JsValue) -> crate::bridge::MarkEntry {
+        let field = |key: &str| js_sys::Reflect::get(entry, &JsValue::from_str(key)).ok();
+        let rects = field("rects")
+            .filter(js_sys::Array::is_array)
+            .map(|list| {
+                js_sys::Array::from(&list)
+                    .iter()
+                    .take(crate::bridge::MAX_MARK_ENTRY_RECTS)
+                    .map(|r| {
+                        if !js_sys::Array::is_array(&r) {
+                            return None;
+                        }
+                        let r = js_sys::Array::from(&r);
+                        if r.length() != 4 {
+                            return None;
+                        }
+                        let v = |i: u32| r.get(i).as_f64();
+                        Some([v(0)?, v(1)?, v(2)?, v(3)?])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::bridge::MarkEntry {
+            page: field("page").and_then(|p| p.as_f64()),
+            rects,
+            style: field("style").and_then(|s| s.as_string()),
+            color: field("color").and_then(|c| c.as_string()),
         }
     }
 

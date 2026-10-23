@@ -1,7 +1,7 @@
 //! The parts of the host bridge (`host` in `main.rs`) that need no browser: checking what the
 //! parent sends, converting rectangles for it, and deciding when a debounced message is due.
 
-use pdfcraft_ui_egui::HostMenuItem;
+use pdfcraft_ui_egui::{HostMark, HostMenuItem, MAX_HOST_MARK_RECTS, MAX_HOST_MARK_RECTS_TOTAL};
 
 /// At most this many host menu items are kept; later entries are dropped.
 pub const MAX_MENU_ITEMS: usize = 8;
@@ -14,6 +14,14 @@ pub const MAX_MENU_LABEL: usize = 64;
 pub const MAX_GOTO_FIND_CHARS: usize = 10_000;
 /// `pdfcraft:selection` is sent once the selection has rested this long (ms).
 pub const SELECTION_DEBOUNCE_MS: f64 = 300.0;
+/// Mark set names are 1–64 characters.
+pub const MAX_MARK_SET_CHARS: usize = 64;
+/// At most this many entries of a `pdfcraft:marks` message are read; the app keeps fewer.
+pub const MAX_MARK_ENTRIES: usize = MAX_HOST_MARK_RECTS_TOTAL;
+/// At most this many rectangles of an entry are read (the app keeps [`MAX_HOST_MARK_RECTS`]).
+pub const MAX_MARK_ENTRY_RECTS: usize = MAX_HOST_MARK_RECTS;
+/// A mark whose colour is missing or not `#rrggbb` / `#rrggbbaa`: coral.
+pub const DEFAULT_MARK_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x5a, 0x30);
 
 /// The items of a `pdfcraft:menu-items` message, one `(key, label)` per array entry (`None`
 /// for a missing or non-string field). Invalid entries are dropped, as are entries past
@@ -52,6 +60,69 @@ pub fn goto_find(find: &str) -> Option<String> {
         None => find,
     };
     (!cut.trim().is_empty()).then(|| cut.to_string())
+}
+
+/// One entry of a `pdfcraft:marks` message as read from the parent: `page`, `rects` (each an
+/// `[x, y, width, height]` of finite numbers, or `None`), `style` and `color` (`None` for a
+/// missing or ill-typed field).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MarkEntry {
+    pub page: Option<f64>,
+    pub rects: Vec<Option<[f64; 4]>>,
+    pub style: Option<String>,
+    pub color: Option<String>,
+}
+
+/// A `pdfcraft:marks` / `pdfcraft:clear-marks` set name: 1–[`MAX_MARK_SET_CHARS`] characters.
+pub fn mark_set(set: &str) -> Option<String> {
+    (!set.is_empty() && set.chars().count() <= MAX_MARK_SET_CHARS).then(|| set.to_string())
+}
+
+/// `#rrggbb` or `#rrggbbaa` (hex digits in either case); anything else is [`DEFAULT_MARK_COLOR`].
+pub fn mark_color(color: Option<&str>) -> egui::Color32 {
+    let parse = |hex: &str| -> Option<egui::Color32> {
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let byte = |i: usize| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex.len() {
+            6 => Some(egui::Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?)),
+            8 => Some(egui::Color32::from_rgba_unmultiplied(byte(0)?, byte(2)?, byte(4)?, byte(6)?)),
+            _ => None,
+        }
+    };
+    color.and_then(|c| c.strip_prefix('#')).and_then(parse).unwrap_or(DEFAULT_MARK_COLOR)
+}
+
+/// A mark rectangle `[x, y, width, height]` (page view space, points) as the app's
+/// `[x0, y0, x1, y1]`; `None` when not finite (also once in `f32`) or when a side is negative.
+pub fn mark_rect(r: [f64; 4]) -> Option<[f32; 4]> {
+    let [x, y, w, h] = r;
+    if !(r.iter().all(|v| v.is_finite()) && w >= 0.0 && h >= 0.0) {
+        return None;
+    }
+    // Out-of-range values become infinite in f32, and are refused below.
+    let out = [x as f32, y as f32, (x + w) as f32, (y + h) as f32];
+    out.iter().all(|v| v.is_finite()).then_some(out)
+}
+
+/// The entries of a `pdfcraft:marks` message, by page in the order each page first appears,
+/// each page's marks in array order (a mark's index is its position there). An entry without a
+/// whole, non-negative page is dropped; one with an unknown `style` (only `"underline"`, the
+/// default when absent) keeps its index but draws nothing, as do rectangles that aren't valid.
+pub fn marks(entries: impl IntoIterator<Item = MarkEntry>) -> Vec<(usize, Vec<HostMark>)> {
+    let mut out: Vec<(usize, Vec<HostMark>)> = Vec::new();
+    for entry in entries.into_iter().take(MAX_MARK_ENTRIES) {
+        let Some(page) = entry.page.and_then(goto_page) else { continue };
+        let underline = entry.style.as_deref().is_none_or(|s| s == "underline");
+        let rects = if underline { entry.rects.into_iter().take(MAX_MARK_ENTRY_RECTS).flatten().filter_map(mark_rect).collect() } else { Vec::new() };
+        let mark = HostMark { rects, color: mark_color(entry.color.as_deref()) };
+        match out.iter_mut().find(|(p, _)| *p == page) {
+            Some((_, list)) => list.push(mark),
+            None => out.push((page, vec![mark])),
+        }
+    }
+    out
 }
 
 /// A page rectangle `[x0, y0, x1, y1]` (view space, points) as the parent gets it:
@@ -216,6 +287,77 @@ mod tests {
         for bad in [-1.0, 0.5, f64::from(u32::MAX) + 1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(request_seq(bad), None, "{bad}");
         }
+    }
+
+    fn mark(page: f64, rects: &[[f64; 4]], style: Option<&str>, color: Option<&str>) -> MarkEntry {
+        MarkEntry { page: Some(page), rects: rects.iter().copied().map(Some).collect(), style: style.map(Into::into), color: color.map(Into::into) }
+    }
+
+    #[test]
+    fn mark_rects_become_x0_y0_x1_y1() {
+        assert_eq!(mark_rect([10.0, 20.0, 100.0, 14.0]), Some([10.0, 20.0, 110.0, 34.0]));
+        assert_eq!(mark_rect([0.0, 0.0, 0.0, 0.0]), Some([0.0; 4]), "an empty rectangle is still one");
+        for bad in [[f64::NAN, 0.0, 1.0, 1.0], [0.0, f64::INFINITY, 1.0, 1.0], [0.0, 0.0, -1.0, 1.0], [0.0, 0.0, 1.0, -0.5], [1e300, 0.0, 1.0, 1.0]] {
+            assert_eq!(mark_rect(bad), None, "{bad:?}");
+        }
+        // Round trip with the rectangles the parent hears in pdfcraft:selection.
+        let r = [12.5, 30.0, 47.25, 14.0];
+        assert_eq!(mark_rect(r).and_then(page_rect), Some(r));
+    }
+
+    #[test]
+    fn mark_colors_are_hex_or_coral() {
+        assert_eq!(mark_color(Some("#ba7517")), egui::Color32::from_rgb(0xba, 0x75, 0x17));
+        assert_eq!(mark_color(Some("#BA7517")), egui::Color32::from_rgb(0xba, 0x75, 0x17));
+        assert_eq!(mark_color(Some("#d85a3080")), egui::Color32::from_rgba_unmultiplied(0xd8, 0x5a, 0x30, 0x80));
+        for bad in [None, Some(""), Some("ba7517"), Some("#ba751"), Some("#ba75170"), Some("#gg0000"), Some("red"), Some("#+1+2+3"), Some("#ééé")]
+        {
+            assert_eq!(mark_color(bad), DEFAULT_MARK_COLOR, "{bad:?}");
+        }
+        assert_eq!(DEFAULT_MARK_COLOR, egui::Color32::from_rgb(0xd8, 0x5a, 0x30));
+    }
+
+    #[test]
+    fn mark_sets_are_short_names() {
+        assert_eq!(mark_set("vocab").as_deref(), Some("vocab"));
+        assert_eq!(mark_set(""), None);
+        assert_eq!(mark_set(&"é".repeat(MAX_MARK_SET_CHARS)).map(|s| s.chars().count()), Some(MAX_MARK_SET_CHARS));
+        assert_eq!(mark_set(&"a".repeat(MAX_MARK_SET_CHARS + 1)), None);
+    }
+
+    #[test]
+    fn marks_group_by_page_and_keep_their_indices() {
+        let coral = Some("#d85a30");
+        let got = marks([
+            mark(3.0, &[[10.0, 20.0, 30.0, 12.0]], Some("underline"), coral),
+            mark(1.0, &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], None, Some("#ba7517")),
+            mark(3.0, &[[0.0, 0.0, 5.0, 5.0]], Some("box"), coral),
+            mark(3.0, &[[f64::NAN, 0.0, 1.0, 1.0], [40.0, 20.0, 10.0, 12.0]], Some("underline"), Some("bad")),
+            mark(-1.0, &[[0.0, 0.0, 1.0, 1.0]], None, coral),
+            mark(2.5, &[[0.0, 0.0, 1.0, 1.0]], None, coral),
+            MarkEntry { page: None, ..Default::default() },
+            mark(5.0, &[], None, None),
+        ]);
+        let pages: Vec<usize> = got.iter().map(|(p, _)| *p).collect();
+        assert_eq!(pages, [3, 1, 5], "pages in first-seen order; bad pages dropped");
+        let (_, three) = &got[0];
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0].rects, [[10.0, 20.0, 40.0, 32.0]]);
+        assert!(three[1].rects.is_empty(), "an unknown style keeps index 1 but draws nothing");
+        assert_eq!(three[2].rects, [[40.0, 20.0, 50.0, 32.0]], "the invalid rectangle alone is dropped");
+        assert_eq!(three[2].color, DEFAULT_MARK_COLOR);
+        assert_eq!(got[1].1[0].rects.len(), 2);
+        assert_eq!(got[1].1[0].color, egui::Color32::from_rgb(0xba, 0x75, 0x17));
+        assert_eq!(got[2].1.len(), 1, "an empty entry clears its page");
+        assert!(got[2].1[0].rects.is_empty());
+    }
+
+    #[test]
+    fn marks_read_at_most_eight_rects_per_entry() {
+        let many: Vec<[f64; 4]> = (0..20).map(|i| [f64::from(i), 0.0, 1.0, 1.0]).collect();
+        let got = marks([mark(0.0, &many, None, None)]);
+        assert_eq!(got[0].1[0].rects.len(), MAX_HOST_MARK_RECTS);
+        assert_eq!(got[0].1[0].rects.last(), Some(&[7.0, 0.0, 8.0, 1.0]));
     }
 
     #[test]

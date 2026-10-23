@@ -465,6 +465,8 @@ pub struct DocView {
     pub(crate) text_failed: HashSet<usize>,
     /// Pages whose text a host wants, visible or not (a passage it sent the reader to, `host`).
     pub(crate) host_text_pages: Vec<usize>,
+    /// A host's marks over the pages (`host`): an overlay, never part of the document.
+    pub(crate) host_marks: crate::host::DocMarks,
     pub find: Option<Find>,
     selection: Option<Selection>,
     /// The selection whose action bar was closed by its Copy button: the bar stays hidden
@@ -776,6 +778,7 @@ impl DocView {
             texts: HashMap::new(),
             text_failed: HashSet::new(),
             host_text_pages: Vec::new(),
+            host_marks: Default::default(),
             find: None,
             selection: None,
             actions_dismissed: None,
@@ -919,6 +922,8 @@ impl DocView {
         fresh.viewport_w = self.viewport_w;
         fresh.viewport_h = self.viewport_h;
         fresh.viewport_screen = self.viewport_screen;
+        // The host's marks are its own, not the file's: they stay over the new version.
+        fresh.host_marks = std::mem::take(&mut self.host_marks);
         *self = fresh;
         // Marks the kept images out of date and clamps the page to the new page count.
         self.document_changed(info);
@@ -3329,6 +3334,11 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
             if view.show_page_gaps {
                 painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(0.5, t.border.gamma_multiply(0.8)), egui::StrokeKind::Outside);
             }
+            // A host's marks (`host`): over the page and its annotations, under PdfCraft's own
+            // overlays (comment handles, find matches, the selection).
+            if !view.host_marks.is_empty() && r.intersects(visible) {
+                view.host_marks.paint(painter, &xf, i, crate::host::mark_line_width(ui.ctx()));
+            }
 
             // Comments: tools, selection, moving and resizing come before text selection.
             let pcx = comments::PageCx { page: i, xf: &xf, info, tool, prefs, allowed, hidden: comments_hidden, redact_mark };
@@ -3547,6 +3557,18 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                 view.links.context = Some((i, l.index));
             }
             let consumed = on_objects || on_edit_text || on_link || on_content || boxing || on_field || comments::page_input(ui, &resp, &pcx, view);
+            // A click on a host's mark (`host`) is reported; the click goes on as usual.
+            if !consumed
+                && unobstructed
+                && matches!(tool, QuickTool::Select | QuickTool::Hand)
+                && resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(p) = pointer.filter(|p| r.contains(*p))
+                && let Some((set, index, union)) = view.host_marks.hit(i, xf.screen_to_view(p))
+            {
+                let rect = xf.view_rect(union);
+                view.host_marks.clicked(crate::host::MarkHit { set, index, page: i, rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y] });
+                ui.ctx().request_repaint();
+            }
 
             let preview_target =
                 (matches!(tool, QuickTool::Select | QuickTool::Fill(_)) && !comments_hidden).then_some(view.comments.selected).flatten();
